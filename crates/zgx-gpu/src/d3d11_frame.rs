@@ -1169,8 +1169,9 @@ pub(crate) struct State {
     /// The backdrop blur's atlas pair (`Frame::blur`), RGBA16F at the size
     /// the batches' plans want, as Direct3D 12's `BlurScratch`.
     pub(crate) blur_atlas: Option<[Surface; 2]>,
-    /// A factor-8 reduce's halves at twice the atlas's size, where a batch
-    /// has such a slot (Direct3D 12's `GpuRenderer::blur_halves`).
+    /// A factor-8 reduce's halves, where a batch has such a slot, at the
+    /// size of Direct3D 12's `GpuRenderer::blur_halves` (fitted to the
+    /// batches, not twice the whole atlas).
     pub(crate) blur_halves: Option<Surface>,
     /// The effect atlas's scratch twin and blank mask (`crate::effects`),
     /// under the shell's scratch texture they stand with; the atlas itself

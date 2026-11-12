@@ -12251,6 +12251,8 @@ impl GpuRenderer {
             let texture = &scratch.atlas[0];
             (texture.width(), texture.height())
         });
+        // `plan_halves` fitted Direct3D 12's halves to every batch above.
+        let halves_size = (self.blur_halves.as_ref()).map(|h| (h.width(), h.height()));
         let state = self.d3d11.as_mut().expect("checked by the caller");
         let device = state.device.clone();
         let parts = [bytemuck::cast_slice(&quads)];
@@ -12340,15 +12342,15 @@ impl GpuRenderer {
         {
             state.blur_atlas = Some(device.blur_atlas(atlas_width, atlas_height)?);
         }
-        // The halves at twice the atlas, where a batch reduces a slot by 8.
-        if let Some((atlas_width, atlas_height)) = atlas_size.filter(|_| {
+        // The halves where a batch reduces a slot by 8, of Direct3D 12's size.
+        if let Some((halves_width, halves_height)) = halves_size.filter(|_| {
             (plans.iter().flatten()).any(|plan| halved(&plan.slots).iter().any(Option::is_some))
         }) && state
             .blur_halves
             .as_ref()
-            .is_none_or(|h| (h.width, h.height) != (atlas_width * 2, atlas_height * 2))
+            .is_none_or(|h| (h.width, h.height) != (halves_width, halves_height))
         {
-            state.blur_halves = Some(device.blur_halves(atlas_width * 2, atlas_height * 2)?);
+            state.blur_halves = Some(device.blur_halves(halves_width, halves_height)?);
         }
         let records = plans
             .iter()
