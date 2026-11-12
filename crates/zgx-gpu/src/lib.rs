@@ -12340,6 +12340,16 @@ impl GpuRenderer {
         {
             state.blur_atlas = Some(device.blur_atlas(atlas_width, atlas_height)?);
         }
+        // The halves at twice the atlas, where a batch reduces a slot by 8.
+        if let Some((atlas_width, atlas_height)) = atlas_size.filter(|_| {
+            (plans.iter().flatten()).any(|plan| halved(&plan.slots).iter().any(Option::is_some))
+        }) && state
+            .blur_halves
+            .as_ref()
+            .is_none_or(|h| (h.width, h.height) != (atlas_width * 2, atlas_height * 2))
+        {
+            state.blur_halves = Some(device.blur_halves(atlas_width * 2, atlas_height * 2)?);
+        }
         let records = plans
             .iter()
             .map(|plan| {
@@ -12432,21 +12442,30 @@ impl GpuRenderer {
                     continue;
                 };
                 let slots: Vec<d3d11_frame::BlurSlot> = (plan.slots.iter())
-                    .map(|(record, (w, h), blurred)| d3d11_frame::BlurSlot {
-                        texels: (record.atlas[0] as u32, record.atlas[1] as u32, *w, *h),
-                        blurred: *blurred,
-                    })
+                    .zip(halved(&plan.slots))
+                    .map(
+                        |((record, (w, h), blurred), halves)| d3d11_frame::BlurSlot {
+                            texels: (record.atlas[0] as u32, record.atlas[1] as u32, *w, *h),
+                            blurred: *blurred,
+                            halves,
+                        },
+                    )
                     .collect();
                 let copies = plan.slots.iter().any(|slot| !slot.2);
                 let records = [&records[0], &records[1]];
-                let drawn = frame.blur(target, atlas, records, &slots, copies)
+                let halves = state.blur_halves.as_ref();
+                let drawn = frame.blur(target, atlas, halves, records, &slots, copies)
                     && frame.blur_back(target, &atlas[0], records, &plan.draws, plan.mixed);
                 if drawn {
+                    // With the halves pass where a slot reduces by 8.
+                    let halved = (slots.iter()).filter(|slot| slot.halves.is_some()).count()
+                        * usize::from(halves.is_some());
                     stats.blur_passes += 3;
-                    stats.render_passes += 3;
+                    stats.render_passes += 3 + usize::from(halved > 0);
                     stats.draw_calls += plan.draws.len()
                         + slots.iter().filter(|slot| slot.blurred).count() * 2
-                        + slots.len();
+                        + slots.len()
+                        + halved;
                 } else {
                     unpainted = true;
                 }
