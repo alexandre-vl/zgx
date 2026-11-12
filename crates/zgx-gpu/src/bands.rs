@@ -677,11 +677,9 @@ impl GpuRenderer {
         stats: &mut crate::GpuStats,
     ) {
         let (uniform, plain) = self.viewport_uniform(band.viewport);
-        // Its regions at their offset (`regions`: where, and the capacity
-        // the group binds).
-        let (viewport, offset) = match regions {
-            Some((offset, capacity)) => (self.regions_group(&uniform, vertices, capacity), offset),
-            None => (plain, 0),
+        let viewport = match regions {
+            Some(place) => self.regions_group(&uniform, vertices, place),
+            None => plain,
         };
         stats.render_passes += 1;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -699,7 +697,7 @@ impl GpuRenderer {
         });
         pass.set_vertex_buffer(0, vertices.slice(..));
         pass.set_bind_group(0, &self.bind, &[]);
-        pass.set_bind_group(1, &viewport, &[offset as u32]);
+        pass.set_bind_group(1, &viewport, &[]);
         if let Some(points) = points {
             pass.set_bind_group(2, points, &[]);
         }

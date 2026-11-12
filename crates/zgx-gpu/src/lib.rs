@@ -2773,7 +2773,7 @@ struct Deferred {
     vertices: wgpu::Buffer,
     draws: Vec<Draw>,
     regions: Vec<(Rect, (u32, u32, u32, u32))>,
-    viewport: Option<(wgpu::BindGroup, u32)>,
+    viewport: Option<wgpu::BindGroup>,
     /// The last filter's vertical half, drawn before `draws`.
     blur: Option<VerticalBlur>,
     /// Clear each region first. False for the tail after a backdrop filter:
@@ -4561,12 +4561,11 @@ pub struct GpuRenderer {
     node_ramps: FxHashMap<NodeId, RampKey>,
     /// SVG sources that failed to draw, reported once each.
     failed_svgs: rustc_hash::FxHashSet<u64>,
-    /// The viewport of the target currently being rendered, and where its
-    /// regions lie in the buffer it binds (`bind_viewport`).
-    viewport_bind: Option<(wgpu::BindGroup, u32)>,
+    /// The viewport of the target currently being rendered.
+    viewport_bind: Option<wgpu::BindGroup>,
     /// Viewport groups binding the frame's regions (`regions_group`), by
-    /// uniform, buffer and capacity.
-    regions_groups: Vec<(wgpu::Buffer, wgpu::Buffer, u64, wgpu::BindGroup)>,
+    /// uniform, buffer and the regions' place in it, the latest last.
+    regions_groups: Vec<(wgpu::Buffer, wgpu::Buffer, (u64, u64), wgpu::BindGroup)>,
     /// Reused upload memory for per-frame vertices; `write_buffer` would
     /// allocate and free a staging buffer every frame.
     belt: RefCell<wgpu::util::StagingBelt>,
@@ -7825,7 +7824,7 @@ impl GpuRenderer {
     }
     fn select_viewport(&mut self, width: f32, height: f32) {
         let key = self.viewport_entry(width, height);
-        self.viewport_bind = self.viewports.get(&key).map(|(_, bind)| (bind.clone(), 0));
+        self.viewport_bind = self.viewports.get(&key).map(|(_, bind)| bind.clone());
         #[cfg(any(target_os = "macos", d3d11))]
         {
             self.viewport_values = [width, height, self.scale, 0.];
@@ -8264,20 +8263,22 @@ impl GpuRenderer {
         }
         &self.backdrops[&size]
     }
-    /// The viewport group binding `uniform` and `capacity` bytes of regions
-    /// in `vertices`, at the offset a pass binds it with: one made for them
-    /// before, or made now (and those for a buffer no longer drawn from let
-    /// go).
+    /// The viewport group binding `uniform` and the regions at `place`
+    /// (offset and size) in `vertices`: one made for them before (a frame
+    /// whose quads kept their size puts its regions where the last did), or
+    /// made now, the oldest of a few let go (and those for a buffer no
+    /// longer drawn from). Bound plainly, not at a dynamic offset: wgpu
+    /// keeps a pass's dynamic offsets in a list it allocates each pass.
     pub(crate) fn regions_group(
         &mut self,
         uniform: &wgpu::Buffer,
         vertices: &wgpu::Buffer,
-        capacity: u64,
+        place: (u64, u64),
     ) -> wgpu::BindGroup {
         if let Some((.., group)) = self
             .regions_groups
             .iter()
-            .find(|(u, v, c, _)| u == uniform && v == vertices && *c == capacity)
+            .find(|(u, v, at, _)| u == uniform && v == vertices && *at == place)
         {
             return group.clone();
         }
@@ -8285,19 +8286,18 @@ impl GpuRenderer {
         self.regions_groups.retain(|(_, v, ..)| {
             v == current || mapped.as_ref().is_some_and(|ring| ring.borrow().holds(v))
         });
-        // Layer sizes come and go (each its uniform): keep it small.
-        if self.regions_groups.len() >= 16 {
-            self.regions_groups.clear();
+        if self.regions_groups.len() >= 8 {
+            self.regions_groups.remove(0);
         }
         let group = self.viewport_group(
             uniform,
             wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                 buffer: vertices,
-                offset: 0,
-                size: wgpu::BufferSize::new(capacity),
+                offset: place.0,
+                size: wgpu::BufferSize::new(place.1),
             }),
         );
-        (self.regions_groups).push((uniform.clone(), vertices.clone(), capacity, group.clone()));
+        (self.regions_groups).push((uniform.clone(), vertices.clone(), place, group.clone()));
         group
     }
     /// Group 1 of the quad pipelines: the viewport `uniform` and `regions`.
@@ -11394,18 +11394,16 @@ impl GpuRenderer {
                 ])
             })
             .collect();
-        // The regions and the filters' records are bound at their offsets as
-        // passes bind their groups (`regions_group`, `blur_groups`): each
-        // group binds a part's capacity, a power of two, so the groups last
-        // while parts stay within it; the buffer holds that much past each.
+        // The filters' records are bound at their offsets as passes bind
+        // their groups (`blur_groups`): each group binds a part's capacity, a
+        // power of two, so the groups last while parts stay within it; the
+        // buffer holds that much past each.
         let capacity = |(offset, size): (u64, u64)| (offset, size.next_power_of_two().max(256));
-        let region_range = region_range.map(capacity);
         let ranges: Vec<Option<[(u64, u64); 2]>> = ranges
             .into_iter()
             .map(|parts| parts.map(|parts| parts.map(capacity)))
             .collect();
-        let reach = (region_range.iter())
-            .chain(ranges.iter().flatten().flatten())
+        let reach = (ranges.iter().flatten().flatten())
             .map(|(offset, capacity)| (offset + capacity) as usize)
             .max()
             .unwrap_or(0);
@@ -11462,8 +11460,7 @@ impl GpuRenderer {
                 ))
                 .map(|(uniform, _)| uniform.clone())
                 .expect("selected above");
-            let group = self.regions_group(&uniform, &vertices, size);
-            self.viewport_bind = Some((group, offset as u32));
+            self.viewport_bind = Some(self.regions_group(&uniform, &vertices, (offset, size)));
         }
         let points_bind = points_range.map(|(offset, size)| {
             let polylines = self.context.inner.quads.polylines();
@@ -11642,7 +11639,7 @@ impl GpuRenderer {
                 }
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_bind_group(0, &self.bind, &[]);
-                bind_viewport(&mut pass, self.viewport_bind.as_ref());
+                pass.set_bind_group(1, self.viewport_bind.as_ref(), &[]);
                 if let Some(points) = &points_bind {
                     pass.set_bind_group(2, points, &[]);
                 }
@@ -12996,7 +12993,7 @@ impl GpuRenderer {
     ) {
         pass.set_vertex_buffer(0, frame.vertices.slice(..));
         pass.set_bind_group(0, &self.bind, &[]);
-        bind_viewport(pass, frame.viewport.as_ref());
+        pass.set_bind_group(1, frame.viewport.as_ref(), &[]);
         if let Some(points) = &frame.points {
             pass.set_bind_group(2, points, &[]);
         }
@@ -17929,14 +17926,6 @@ fn halves_pass<'a>(
     stats.render_passes += 1;
     reading
 }
-/// Bind a viewport group (`GpuRenderer::viewport_bind`) as group 1, its
-/// regions at their offset.
-fn bind_viewport(pass: &mut wgpu::RenderPass<'_>, viewport: Option<&(wgpu::BindGroup, u32)>) {
-    match viewport {
-        Some((group, offset)) => pass.set_bind_group(1, group, &[*offset]),
-        None => pass.set_bind_group(1, None, &[]),
-    }
-}
 /// A blur pass's bind group (`BlurPipelines::layout`): `source` and
 /// `other` read, the records' two parts in `records` up to `capacity`
 /// bytes each, at the offsets the pass binds it with.
@@ -20434,15 +20423,12 @@ fn create_quad_pipelines(
                 },
                 count: None,
             },
-            // The frame's regions, in its vertex buffer at an offset that
-            // moves from frame to frame: given as a pass binds the group, so
-            // the group lasts (`GpuRenderer::regions_group`).
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: true,
+                    has_dynamic_offset: false,
                     min_binding_size: None,
                 },
                 count: None,
