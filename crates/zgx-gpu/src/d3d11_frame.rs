@@ -1251,7 +1251,10 @@ impl State {
     /// Blur batch `batch`'s records, part `part` (`crate::BlurRecord`s or
     /// `crate::SlotRecord`s as bytes), as the raw buffer blur.wgsl reads:
     /// written into the buffer kept for them, made or grown first if it
-    /// must be.
+    /// must be. Each batch and part has its own (a frame's batches write
+    /// none twice); the next frame's write comes after this frame's draws
+    /// on the immediate context (`UpdateSubresource` on a default buffer,
+    /// never mapped), so they read what this frame wrote.
     pub(crate) fn set_blur_records(
         &mut self,
         batch: usize,
