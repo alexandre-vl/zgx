@@ -7,7 +7,9 @@
 //! them as wgpu-hal's `create_pipeline_layout` assigns them (each group's
 //! views in order, a CBV per uniform buffer and an SRV per texture or
 //! read-only storage buffer; its samplers by index into the group's sampler
-//! index buffer, an SRV after its views; the sampler heaps at s0 and s2048),
+//! index buffer, an SRV after its views; a storage buffer at a dynamic
+//! offset an SRV too, its offset in a group's root constants, a CBV after
+//! those; the sampler heaps at s0 and s2048),
 //! and naga writes the HLSL with wgpu-hal's other options. Checked against the
 //! wgpu-hal named in `DX12_FILL_CHECKED_WGPU_HAL` (lib.rs; its test runs on
 //! every platform's CI),
@@ -36,6 +38,8 @@ enum Entry {
     Sampler(u32),
     Uniform(u32),
     StorageRead(u32),
+    /// Read-only storage at a dynamic offset (the frame's regions).
+    StorageReadDynamic(u32),
 }
 
 /// `layout`'s groups, entries in the order the layouts declare them
@@ -43,7 +47,7 @@ enum Entry {
 fn groups(layout: Layout) -> Vec<Vec<Entry>> {
     let quads = vec![
         vec![Entry::Texture(1), Entry::Sampler(2)],
-        vec![Entry::Uniform(0), Entry::StorageRead(1)],
+        vec![Entry::Uniform(0), Entry::StorageReadDynamic(1)],
     ];
     let backdrop = vec![Entry::Texture(0)];
     match layout {
@@ -71,11 +75,13 @@ pub(crate) fn options(layout: Layout) -> hlsl::Options {
     };
     let mut binding_map = hlsl::BindingMap::default();
     let mut sampler_buffer_binding_map = hlsl::SamplerIndexBufferBindingMap::default();
+    let mut offsets_targets = std::collections::BTreeMap::new();
     let (mut cbv, mut srv) = (0u32, 0u32);
     for (group, entries) in groups(layout).iter().enumerate() {
         let group = group as u32;
         let binding = |binding| naga::ResourceBinding { group, binding };
-        // Views, in order.
+        // Views, in order; storage at dynamic offsets counted.
+        let mut dynamic = 0;
         for entry in entries {
             match *entry {
                 Entry::Uniform(b) => {
@@ -84,6 +90,15 @@ pub(crate) fn options(layout: Layout) -> hlsl::Options {
                 }
                 Entry::Texture(b) | Entry::StorageRead(b) => {
                     binding_map.insert(binding(b), target(0, srv));
+                    srv += 1;
+                }
+                Entry::StorageReadDynamic(b) => {
+                    let at = hlsl::BindTarget {
+                        dynamic_storage_buffer_offsets_index: Some(dynamic),
+                        ..target(0, srv)
+                    };
+                    binding_map.insert(binding(b), at);
+                    dynamic += 1;
                     srv += 1;
                 }
                 Entry::Sampler(_) => {}
@@ -102,6 +117,16 @@ pub(crate) fn options(layout: Layout) -> hlsl::Options {
                 .insert(hlsl::SamplerIndexBufferKey { group }, target(0, srv));
             srv += 1;
         }
+        // The dynamic offsets, root constants at the CBV after the group's.
+        if dynamic != 0 {
+            let offsets = hlsl::OffsetsBindTarget {
+                space: 0,
+                register: cbv,
+                size: dynamic,
+            };
+            offsets_targets.insert(group, offsets);
+            cbv += 1;
+        }
     }
     hlsl::Options {
         shader_model: hlsl::ShaderModel::V5_1,
@@ -109,7 +134,7 @@ pub(crate) fn options(layout: Layout) -> hlsl::Options {
         fake_missing_bindings: false,
         special_constants_binding: None,
         immediates_target: None,
-        dynamic_storage_buffer_offsets_targets: Default::default(),
+        dynamic_storage_buffer_offsets_targets: offsets_targets,
         zero_initialize_workgroup_memory: true,
         restrict_indexing: true,
         sampler_heap_target: hlsl::SamplerHeapBindTargets {
@@ -158,8 +183,8 @@ mod tests {
     use super::*;
 
     /// The quads' registers as wgpu-hal gives them: the texture t0, its
-    /// sampler's index buffer t1, the viewport b0, the regions t2; the
-    /// blend's backdrop t3.
+    /// sampler's index buffer t1, the viewport b0, the regions t2 (their
+    /// offset at b1); the blend's backdrop t3.
     #[test]
     fn the_registers_follow_wgpu_hals_order() {
         let at = |options: &hlsl::Options, group, binding| {
@@ -171,6 +196,15 @@ mod tests {
         assert_eq!(at(&quads, 0, 2), (255, 0));
         assert_eq!(at(&quads, 1, 0), (0, 0));
         assert_eq!(at(&quads, 1, 1), (0, 2));
+        // The regions at a dynamic offset: the group's first, its offsets in
+        // root constants at b1.
+        let regions = quads.binding_map[&naga::ResourceBinding {
+            group: 1,
+            binding: 1,
+        }];
+        assert_eq!(regions.dynamic_storage_buffer_offsets_index, Some(0));
+        let offsets = &quads.dynamic_storage_buffer_offsets_targets[&1];
+        assert_eq!((offsets.space, offsets.register, offsets.size), (0, 1, 1));
         let buffer = quads.sampler_buffer_binding_map[&hlsl::SamplerIndexBufferKey { group: 0 }];
         assert_eq!((buffer.space, buffer.register), (0, 1));
         assert_eq!(at(&options(Layout::Blend), 2, 0), (0, 3));
