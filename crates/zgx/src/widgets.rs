@@ -3632,6 +3632,7 @@ impl Ui {
         }
         // Whether the host draws the caret, now that it is laid out.
         crate::caret_blink::settle(self);
+        crate::compose::spare_children_rest();
         Ok(())
     }
     /// Keep `padding` clear inside scroll view `viewport` (its root) when

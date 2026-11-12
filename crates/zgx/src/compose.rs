@@ -1167,6 +1167,9 @@ impl View {
     }
     /// Add `child` after the existing children.
     pub fn child(mut self, child: impl Into<View>) -> Self {
+        if self.children.capacity() == 0 {
+            self.children = spare_children();
+        }
         self.children.push(child.into());
         self
     }
@@ -5743,10 +5746,77 @@ fn mount_element(
         keep_scrollbar_style(ui, opened.root);
     }
     ui.open_element(opened.root);
-    for child in std::mem::take(&mut opened.children) {
+    let mut children = std::mem::take(&mut opened.children);
+    for child in children.drain(..) {
         mount(ui, opened.child_parent, child, opened.environment.clone());
     }
+    if children.capacity() != 0 {
+        keep_children(children);
+    }
     close_element(ui, opened)
+}
+thread_local! {
+    /// Children lists of views mounted, emptied, for the views built next
+    /// (`View::child`): a list scrolling rows in builds and mounts a row's
+    /// views one after another, a list of views (each hundreds of bytes)
+    /// each. Kept only while views come and go: frames that take or give
+    /// none in a row (`SPARES_IDLE`) let them go (`spare_children_rest`).
+    /// With the frames since one did.
+    static SPARE_CHILDREN: RefCell<(Vec<Vec<View>>, u8)> = const { RefCell::new((Vec::new(), 0)) };
+}
+/// Children lists kept for views built next (`SPARE_CHILDREN`): a row
+/// built whole before it mounts, a few dozen levels deep (a transcript's
+/// message, each part in its own column), takes one a level. And the
+/// longest kept: a row's few.
+const SPARE_CHILDREN_KEPT: usize = 64;
+const SPARE_CHILDREN_ROOM: usize = 16;
+/// An empty children list: one a mounted view left when there is one
+/// (`SPARE_CHILDREN`).
+#[inline(never)]
+fn spare_children() -> Vec<View> {
+    SPARE_CHILDREN
+        .try_with(|spare| {
+            let mut spare = spare.borrow_mut();
+            let list = spare.0.pop();
+            if list.is_some() {
+                spare.1 = 0;
+            }
+            list
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+/// A mounted view's children list, emptied, for a view built next
+/// (`SPARE_CHILDREN`), up to a bound.
+#[cold]
+#[inline(never)]
+fn keep_children(children: Vec<View>) {
+    if children.capacity() > SPARE_CHILDREN_ROOM {
+        return;
+    }
+    let _ = SPARE_CHILDREN.try_with(|spare| {
+        let mut spare = spare.borrow_mut();
+        if spare.0.len() < SPARE_CHILDREN_KEPT {
+            spare.0.push(children);
+            spare.1 = 0;
+        }
+    });
+}
+/// After a frame: the spare children lists go once `SPARES_IDLE` frames
+/// in a row took or gave none (views stopped coming and going), so a UI
+/// at rest keeps none.
+pub(crate) fn spare_children_rest() {
+    let _ = SPARE_CHILDREN.try_with(|spare| {
+        let mut spare = spare.borrow_mut();
+        if spare.0.capacity() == 0 {
+            return;
+        }
+        spare.1 = spare.1.saturating_add(1);
+        if spare.1 >= crate::scene::SPARES_IDLE {
+            spare.0 = Vec::new();
+        }
+    });
 }
 /// A scroll view's or a list's own scrollbar style, taken before its
 /// element opens (a list's edges go to its region there) and held for the

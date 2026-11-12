@@ -55,6 +55,13 @@ const EXPIRED_PASS: u64 = u64::MAX - 1;
 /// The children a column has as it looks at its end alone
 /// (`Scene::children_outgrown`): fewer cost little to lay out whole.
 const COLUMN_KEPT_FROM: usize = 64;
+/// Children lists of removed nodes kept for new ones (`spare_children`):
+/// a frame's rows scrolled out, a few hundred nodes.
+const SPARE_CHILDREN: usize = 512;
+/// Flushes (and a UI's frames) in a row with no spare list given or taken
+/// after which the spare lists go: a fast scroll brings a row in every
+/// frame or two, and a scene at rest keeps none.
+pub(crate) const SPARES_IDLE: u8 = 8;
 /// Layout passes in a row a column lays out whole before it stops looking at
 /// its end alone (`Scene::column_laid_out_whole`): one that isn't streamed
 /// into pays no more than this.
@@ -3248,6 +3255,18 @@ pub struct Scene {
     /// row no longer holding one, or its slot reused) costs one layout from
     /// that row, which clears it.
     shrank: Vec<u64>,
+    /// Children lists of removed nodes, emptied, for the next nodes given
+    /// a first child (`first_child`): a list that scrolls rows in and out
+    /// makes and frees one a row a frame. Kept only while rows come and go:
+    /// a flush that took or gave none lets them go (`spares_rest`).
+    spare_children: Vec<Vec<NodeId>>,
+    /// Removed nodes' results' place lists, emptied, for the next
+    /// containers laid out with none of their own (`measure_uncached`), as
+    /// `spare_children`.
+    spare_placements: Vec<Vec<ChildPlacement>>,
+    /// Flushes in a row since `spare_children` or `spare_placements` gave
+    /// or took any (`SPARES_IDLE`).
+    spares_idle: u8,
     slots: Vec<Slot>,
     free: Vec<u32>,
     /// Slots of nodes removed and not yet freed (`kill`).
@@ -3557,6 +3576,9 @@ impl Scene {
         Self {
             pending_children: std::cell::Cell::new(u32::MAX),
             shrank: Default::default(),
+            spare_children: Vec::new(),
+            spare_placements: Vec::new(),
+            spares_idle: 0,
             identity: NEXT_SCENE_ID
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("scene identity exhausted"),
@@ -4036,6 +4058,10 @@ impl Scene {
             + vec_bytes(&self.repaints)
             + vec_bytes(&self.inert)
             + vec_bytes(&self.shrank)
+            + vec_bytes(&self.spare_children)
+            + self.spare_children.iter().map(vec_bytes).sum::<usize>()
+            + vec_bytes(&self.spare_placements)
+            + self.spare_placements.iter().map(vec_bytes).sum::<usize>()
             + map_bytes(&self.contents_styles)
             + map_bytes(&self.given_styles)
             + map_bytes(&self.directions)
@@ -7749,6 +7775,8 @@ impl Scene {
                 self.long_lists = true;
                 self.children_outgrown(parent);
                 self.node_mut(parent).children.get_mut().push(id);
+            } else if siblings.capacity() == 0 {
+                self.first_child(parent, id);
             } else {
                 siblings.push(id);
             }
@@ -8025,8 +8053,17 @@ impl Scene {
         if node.style.fade_overflow {
             self.overflow_fades.retain(|(entry, _)| *entry != id);
         }
-        for child in node.head.children.into_inner() {
+        let children = node.head.children.into_inner();
+        for &child in &children {
             crate::deep(0, || self.free_subtree(child));
+        }
+        if children.capacity() != 0 {
+            self.keep_children(children);
+        }
+        if let Some(measured) = node.measurement
+            && measured.children.capacity() != 0
+        {
+            self.keep_placements(measured.children);
         }
         self.slots[id.index as usize].generation = self.slots[id.index as usize]
             .generation
@@ -12315,6 +12352,11 @@ impl Scene {
             _ => Vec::new(),
         };
         children.clear();
+        // A container laid out first: a removed node's list, while rows
+        // come and go (`spare_placements`).
+        if !self.spare_placements.is_empty() && children.capacity() == 0 && layout.is_some() {
+            children = self.spare_placement();
+        }
         let (mut width, mut height) = match layout {
             None => self.leaf_size(id, &style, available_w),
             // An empty box (a bar, a swatch, a spacer): its padding and size,
@@ -14410,6 +14452,9 @@ impl Scene {
         }
         let mut report = FrameReport::default();
         self.repaint_flushes += 1;
+        if !self.spare_children.is_empty() || !self.spare_placements.is_empty() {
+            self.spares_rest();
+        }
         // Read, or past what a renderer would patch rather than redraw: from
         // this flush on. Kept only while a renderer reads them (most never
         // do): otherwise from the next.
@@ -14786,14 +14831,92 @@ impl Scene {
     #[cold]
     #[inline(never)]
     fn removing_subtree(&mut self, id: NodeId) {
-        let mut ids = vec![id];
-        let mut at = 0;
-        while let Some(&id) = ids.get(at) {
-            at += 1;
-            let children = self.children_raw(self.node(id)).clone();
-            ids.extend(children);
+        // Walked into the list it is noted in (`removed`), which keeps its
+        // room from one flush to the next: no list of its own, and no copy
+        // of each node's children.
+        let Some(changes) = self.changes.get_mut() else {
+            return;
+        };
+        if changes.read.replace(false) {
+            changes.noted.clear();
+            changes.read_len.set(0);
+            changes.dropping = false;
         }
-        self.removed(&ids);
+        if changes.dropping {
+            return;
+        }
+        let mut noted = std::mem::take(&mut changes.noted);
+        let mut at = noted.len();
+        noted.push(id);
+        while let Some(&id) = noted.get(at) {
+            at += 1;
+            noted.extend_from_slice(self.children_raw(self.node(id)));
+        }
+        let flushes = self.repaint_flushes;
+        let changes = self.changes.get_mut().expect("noting changes");
+        changes.noted = noted;
+        if changes.noted.len() > REPAINTS_KEPT {
+            changes.noted = Vec::new();
+            changes.read_len.set(0);
+            // These were the next flush's: what is read next starts after.
+            changes.since.set(flushes + 2);
+            changes.dropping = true;
+        }
+    }
+    /// `id`'s first child, `child`, in a removed node's children list when
+    /// one is spare (`spare_children`).
+    #[inline(never)]
+    fn first_child(&mut self, parent: NodeId, child: NodeId) {
+        let spare = self.spare_children.pop();
+        let siblings = self.node_mut(parent).children.get_mut();
+        if let Some(spare) = spare {
+            *siblings = spare;
+            self.spares_idle = 0;
+            self.node_mut(parent).children.get_mut().push(child);
+        } else {
+            siblings.push(child);
+        }
+    }
+    /// A removed node's children list, emptied, for another node
+    /// (`spare_children`), up to a bound.
+    #[cold]
+    #[inline(never)]
+    fn keep_children(&mut self, mut children: Vec<NodeId>) {
+        if self.spare_children.len() < SPARE_CHILDREN {
+            children.clear();
+            self.spare_children.push(children);
+            self.spares_idle = 0;
+        }
+    }
+    /// A removed node's result's place list, emptied, for another node
+    /// (`spare_placements`), up to a bound.
+    #[cold]
+    #[inline(never)]
+    fn keep_placements(&mut self, mut placements: Vec<ChildPlacement>) {
+        if self.spare_placements.len() < SPARE_CHILDREN {
+            placements.clear();
+            self.spare_placements.push(placements);
+            self.spares_idle = 0;
+        }
+    }
+    /// A spare place list (`spare_placements`), known to be there.
+    #[cold]
+    #[inline(never)]
+    fn spare_placement(&mut self) -> Vec<ChildPlacement> {
+        self.spares_idle = 0;
+        self.spare_placements.pop().unwrap_or_default()
+    }
+    /// At a flush: the spare lists go once `SPARES_IDLE` flushes in a row
+    /// gave or took none (rows stopped coming and going), so a scene at
+    /// rest keeps none.
+    #[cold]
+    #[inline(never)]
+    fn spares_rest(&mut self) {
+        self.spares_idle = self.spares_idle.saturating_add(1);
+        if self.spares_idle >= SPARES_IDLE {
+            self.spare_children = Vec::new();
+            self.spare_placements = Vec::new();
+        }
     }
     /// Note `ids`, a subtree's nodes removed at once, in
     /// [`Scene::resource_changes`]. Those a renderer has read go first. Past the bound, all go, and none are
@@ -23258,6 +23381,70 @@ mod local_transform_tests {
     /// renderer learns of as it draws and checks them. Kept until read,
     /// however many flushes; past its bound, given up, and its range starts
     /// past the gap.
+    /// A row scrolled out leaves its nodes' children and place lists for
+    /// the rows scrolled in (`spare_children`, `spare_placements`); a flush
+    /// with none coming or going lets them go, so a scene at rest keeps
+    /// none, and a removed subtree is still named whole to a renderer.
+    #[test]
+    fn rows_scrolled_out_lend_their_lists_to_rows_scrolled_in_and_none_stay_at_rest() {
+        let mut scene = Scene::new(400., 400.);
+        let root = scene.root();
+        scene.resource_changes();
+        let column = Style {
+            width: Some(300.),
+            ..Style::default()
+        };
+        let row = |scene: &mut Scene| {
+            let row = scene.append(root, NodeKind::Container(Layout::Row), column.clone());
+            let cell = scene.append(row, NodeKind::Container(Layout::Column), Style::default());
+            for _ in 0..3 {
+                scene.append(cell, NodeKind::Container(Layout::Row), Style::default());
+            }
+            (row, cell)
+        };
+        let (first, cell) = row(&mut scene);
+        scene.flush();
+        scene.resource_changes();
+        scene.remove(first);
+        assert_eq!(
+            scene.spare_children.len(),
+            2,
+            "the row's and its cell's lists"
+        );
+        assert_eq!(
+            scene.spare_placements.len(),
+            2,
+            "their results' place lists"
+        );
+        let (_, changed) = scene.resource_changes();
+        assert_eq!(changed.len(), 5, "the whole subtree named, its root first");
+        assert_eq!(changed[0], first);
+        assert!(changed.contains(&cell));
+        let (second, _) = row(&mut scene);
+        assert!(scene.spare_children.is_empty(), "the next row's took them");
+        scene.flush();
+        assert!(scene.spare_placements.is_empty(), "its layout took them");
+        assert!(scene.contains(second));
+        // Rows still coming and going: what one leaves waits for the next.
+        scene.remove(second);
+        scene.flush();
+        assert!(!scene.spare_children.is_empty());
+        // Then none: after a few flushes (that one counted) they go.
+        for _ in 2..SPARES_IDLE {
+            scene.flush();
+        }
+        assert!(!scene.spare_children.is_empty(), "kept between rows");
+        scene.flush();
+        assert!(scene.spare_children.is_empty() && scene.spare_placements.is_empty());
+        assert_eq!(
+            (
+                scene.spare_children.capacity(),
+                scene.spare_placements.capacity()
+            ),
+            (0, 0),
+            "nothing held at rest"
+        );
+    }
     #[test]
     fn resource_changes_name_the_nodes_whose_resources_changed() {
         let image = |n: u8| Arc::new(crate::image::ImageData::new(1, 1, vec![n; 4]).unwrap());
