@@ -1702,6 +1702,8 @@ pub(crate) struct UiStorage {
     held_scrollbar_style: RefCell<Option<Rc<crate::compose_scrollbar::ScrollbarStyle>>>,
     /// Input is being dispatched: what scrolls now, the user scrolled.
     dispatching: Cell<bool>,
+    /// When input that acts was last dispatched (`Ui::acted_at`).
+    acted_at: Cell<Option<Instant>>,
     /// A platform's wheel is being dispatched (`Ui::wheel_in_window`).
     wheel_in_window: Cell<bool>,
     /// What hears every event the document gets (`Ui::on_document_event`):
@@ -2038,6 +2040,7 @@ impl Ui {
             scrollbar_styles: Default::default(),
             held_scrollbar_style: Default::default(),
             dispatching: Cell::new(false),
+            acted_at: Cell::new(None),
             wheel_in_window: Cell::new(false),
             document_listeners: RefCell::new(Vec::new()),
         });
@@ -4577,6 +4580,15 @@ impl Ui {
         self.storage.dispatching.set(false);
         Ok(result)
     }
+    /// When input that acts (a press or release, a key, text, an action)
+    /// was last dispatched: the frames it makes answer someone, and a host
+    /// draws each at once and shows it as soon as it's ready, rather than on
+    /// the refresh's tick and the cadence of frames before (zgx-desktop's
+    /// refresh grid). Renderer plumbing, not a stable API.
+    #[doc(hidden)]
+    pub fn acted_at(&self) -> Option<Instant> {
+        self.storage.acted_at.get()
+    }
     /// Whether the wheel being dispatched is a platform's, in the window's
     /// points, rather than one the engine made in a scroll view's own.
     pub(crate) fn wheel_in_window(&self) -> bool {
@@ -4595,6 +4607,9 @@ impl Ui {
         ),
         dispatch: impl FnOnce(&Self, InputEvent) -> crate::input::DispatchResult,
     ) -> crate::input::DispatchResult {
+        if acts(&event) {
+            self.storage.acted_at.set(Some(Instant::now()));
+        }
         let elastic = self.storage.elastic.borrow().enabled;
         let event = match event {
             InputEvent::ScrollGesture(phase) => {
@@ -8062,6 +8077,28 @@ fn input_draw_pending(node: NodeId, scene: &Rc<RefCell<Scene>>) -> bool {
                     .is_some_and(|storage| Rc::ptr_eq(&storage.scene, scene))
         })
     })
+}
+
+/// Whether `event` is input that acts (a press or its release, where a
+/// click lands, a key, text, an action), which a frame answers: not a
+/// pointer passing over, nor focus moving, nor a scroll, which keeps the
+/// refresh's pace and has a liveness of its own (`Ui::acted_at`).
+fn acts(event: &InputEvent) -> bool {
+    matches!(
+        event,
+        InputEvent::PointerDown { .. }
+            | InputEvent::PointerUp { .. }
+            | InputEvent::KeyDown { .. }
+            | InputEvent::Text(_)
+            | InputEvent::ImePreedit { .. }
+            | InputEvent::ImeCommit(_)
+            | InputEvent::Action(_)
+            | InputEvent::Activate
+            | InputEvent::Increment
+            | InputEvent::Decrement
+            | InputEvent::SetValue(_)
+            | InputEvent::SetNumericValue(_)
+    )
 }
 
 #[cfg(test)]
