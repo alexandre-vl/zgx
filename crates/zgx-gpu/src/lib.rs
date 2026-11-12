@@ -4720,6 +4720,9 @@ pub struct GpuRenderer {
     /// The points of the frame's polyline strokes (polyline.wgsl), kept for
     /// their allocation.
     frame_points: Vec<[f32; 2]>,
+    /// The frame's records after its quads (clip regions, polyline points,
+    /// filters' records), kept from frame to frame as `frame_quads` is.
+    frame_records: Vec<u8>,
     /// The window's last whole paint, while only leaves repaint
     /// (`render_kept`).
     kept: Option<Box<Kept>>,
@@ -5541,6 +5544,7 @@ impl GpuRenderer {
             vertex_capacity: VERTICES_AT_REST,
             frame_quads: Vec::new(),
             frame_points: Vec::new(),
+            frame_records: Vec::new(),
             kept: None,
             patch_stats: GpuStats::default(),
             patched: false,
@@ -11367,7 +11371,8 @@ impl GpuRenderer {
         let bytes: &[u8] = bytemuck::cast_slice(&quads);
         let align = self.device.limits().min_storage_buffer_offset_alignment as usize;
         // Each part at an aligned offset in the buffer.
-        let mut records = Vec::new();
+        let mut records = std::mem::take(&mut self.frame_records);
+        records.clear();
         let mut record = |part: &[u8]| {
             let at = (bytes.len() + records.len()).next_multiple_of(align);
             records.resize(at - bytes.len(), 0);
@@ -11446,6 +11451,7 @@ impl GpuRenderer {
             self.belt.get_mut().finish();
             vertices
         };
+        self.frame_records = records;
         if let Some((offset, size)) = region_range {
             let uniform = self
                 .viewports
@@ -16807,6 +16813,7 @@ impl GpuRenderer {
         // A frame's quads and draws: the next frame makes them again.
         self.frame_quads = Vec::new();
         self.frame_points = Vec::new();
+        self.frame_records = Vec::new();
         self.frame_draws = Vec::new();
         self.visible_glyphs = Vec::new();
         self.frame_peaks = (0, 0);
