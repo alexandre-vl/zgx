@@ -433,9 +433,6 @@ pub(crate) struct Shaders {
     pub layer: Option<Arc<zgx::decoration::FillShader>>,
     /// `layer_params`: the layer shader's sixteen values, as four vec4s.
     pub layer_params: Option<[[f32; 4]; 4]>,
-    /// Its parameters given as theme colours: the engine's drive resolves
-    /// them (`ShaderDrive::tokens`), and follows the theme.
-    pub layer_tokens: [Option<zgx::theme::TokenId>; 4],
     /// `layer_bleed`: how far past the box the layer shader paints.
     pub layer_bleed: Option<f32>,
     /// `layer_reach`: how far past that its `zgx_backdrop` reads.
@@ -443,6 +440,18 @@ pub(crate) struct Shaders {
     /// `layer_clock`, `shader_clock`, `layer_on`, `layer_params` as a function:
     /// the engine keeps it up (boxed: few shaders are).
     pub drive: Option<DriveBox>,
+}
+impl Shaders {
+    /// A driven shader fill's theme colours handed to its drive, once both
+    /// are known (properties come in any order): it keeps them up, where in
+    /// the style a theme change would put its time back.
+    fn tokens_to_drive(&mut self) {
+        if let Some(drive) = &mut self.drive
+            && self.tokens.iter().any(Option::is_some)
+        {
+            drive.tokens = std::mem::take(&mut self.tokens);
+        }
+    }
 }
 /// How a `ui.glass` looks: its props, each a value or state.
 #[derive(Clone)]
@@ -557,6 +566,11 @@ pub(crate) struct DriveProps {
     pub layer_on: Option<Source>,
     /// `layer_params` as a function: followed.
     pub layer_params_of: Option<Function>,
+    /// The shader fill's and the layer shader's parameters given as theme
+    /// colours, where the drive keeps them up (`ShaderDrive::tokens`): in
+    /// the style, a theme change would put the drive's time back.
+    pub tokens: [Option<zgx::theme::TokenId>; 4],
+    pub layer_tokens: [Option<zgx::theme::TokenId>; 4],
 }
 /// `ui.layer_shader(source, opts)`: a compiled layer shader, for
 /// `layer_shader` (see `zgx::scene::LayerShader`).
@@ -4256,6 +4270,7 @@ fn fill_from(
                     "shader_params",
                     Some(&mut shaders.tokens),
                 )?);
+                shaders.tokens_to_drive();
             }
             "layer_shader" => {
                 let mlua::Value::UserData(ud) = &value else {
@@ -4273,12 +4288,13 @@ fn fill_from(
                         shaders.drive.get_or_insert_default().layer_params_of = Some(f.clone());
                     }
                     _ => {
+                        let mut tokens = [None; 4];
                         let params =
-                            shader_params(lua, &value, "layer_params", Some(&mut shaders.layer_tokens))?;
+                            shader_params(lua, &value, "layer_params", Some(&mut tokens))?;
                         shaders.layer_params = Some(params);
                         // A layer's theme colours are the drive's to keep up.
-                        if shaders.layer_tokens.iter().any(Option::is_some) {
-                            shaders.drive.get_or_insert_default();
+                        if tokens.iter().any(Option::is_some) {
+                            shaders.drive.get_or_insert_default().layer_tokens = tokens;
                         }
                     }
                 }
@@ -4291,11 +4307,13 @@ fn fill_from(
                     "layer_clock" => drive.layer_clock = on,
                     _ => drive.shader_clock = on,
                 }
+                shaders.tokens_to_drive();
             }
             "layer_on" => {
                 let on = source(lua, Ty::Bool, key, value)?;
                 let shaders = node.shaders.get_or_insert_default();
                 shaders.drive.get_or_insert_default().layer_on = Some(on);
+                shaders.tokens_to_drive();
             }
             "layer_bleed" | "layer_reach" => {
                 let length = lua.unpack::<f32>(value)?;
